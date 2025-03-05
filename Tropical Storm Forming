@@ -1,0 +1,71 @@
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, confusion_matrix
+
+# 1. Create the DataFrame directly
+data = {
+    "week_id": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    "mean_sea_level_pressure": [1013, 1010, 1012, 1008, 1014, 1005, 1011, 1007, 1013, 1006, 1012, 1009],
+    "sea_surface_temp": [28.5, 29.0, 27.5, 29.2, 27.0, 29.8, 28.2, 29.5, 28.0, 29.6, 28.3, 29.3],
+    "wind_speed": [15, 18, 12, 20, 10, 22, 14, 19, 15, 21, 13, 17],
+    "humidity": [75, 80, 70, 85, 65, 88, 73, 82, 75, 86, 72, 80],
+    "region": ["Coastal_North"] * 12,
+    "storm_formed": [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
+}
+
+df = pd.DataFrame(data)
+
+# Feature Engineering
+df['sst_lag_1'] = df['sea_surface_temp'].shift(1)
+df['pressure_lag_1'] = df['mean_sea_level_pressure'].shift(1)
+df.dropna(inplace=True)
+
+# Define Features and Target
+feature_cols = ['mean_sea_level_pressure', 'sea_surface_temp', 'wind_speed', 'humidity', 'sst_lag_1', 'pressure_lag_1']
+X = df[feature_cols]
+y = df['storm_formed']
+
+# Train-Test Split
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Train Logistic Regression Model
+logreg = LogisticRegression()
+logreg.fit(X_train, y_train)
+
+# Predictions
+y_pred = logreg.predict(X_test)
+
+# Evaluation
+print(confusion_matrix(y_test, y_pred))
+print(classification_report(y_test, y_pred))
+
+# Predict Probabilities
+y_prob = logreg.predict_proba(X_test)[:, 1]
+
+def assign_alert_level(prob):
+    if prob < 0.2:
+        return "Green"
+    elif prob < 0.4:
+        return "Yellow"
+    elif prob < 0.6:
+        return "Orange"
+    else:
+        return "Red"
+
+alerts = [assign_alert_level(p) for p in y_prob]
+for i, alert in enumerate(alerts):
+    print(f"Test sample {i} - Probability: {y_prob[i]:.2f} - Alert Level: {alert}")
+
+# Visualization
+plt.scatter(range(len(y_test)), y_prob, c=y_test, cmap='bwr', alpha=0.7)
+plt.axhline(0.6, color='red', linestyle='--', label='Red alert threshold (0.6)')
+plt.axhline(0.4, color='orange', linestyle='--', label='Orange alert threshold (0.4)')
+plt.axhline(0.2, color='yellow', linestyle='--', label='Yellow alert threshold (0.2)')
+plt.title('Predicted Probability of Storm Formation')
+plt.xlabel('Test Sample Index')
+plt.ylabel('Probability')
+plt.legend()
+plt.show()

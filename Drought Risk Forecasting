@@ -1,0 +1,262 @@
+"""
+advanced_drr_time_series.py
+
+Demonstration of an advanced, end-to-end Python AI project for DRR:
+
+1) Synthetic Data Creation (time-series weather + drought index).
+2) Data Cleaning + Feature Engineering.
+3) LSTM Model Training (Keras).
+4) Model Evaluation (metrics + visualization).
+5) Model Saving (both .keras format and TF SavedModel) + Simple Flask Deployment Example.
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import datetime
+
+# TensorFlow / Keras
+import tensorflow as tf
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+
+# Flask for deployment
+from flask import Flask, request, jsonify
+
+# ------------------------------------------
+# 1. Create Synthetic Time-Series Data
+# ------------------------------------------
+
+def create_synthetic_drought_data(num_weeks=200):
+    """
+    Generate synthetic weekly data with columns:
+     - date (Weekly intervals)
+     - rainfall (mm)
+     - temperature (°C)
+     - soil_moisture (%)
+     - drought_index (0-5 scale)
+    to simulate cyclical weather patterns for DRR forecasting.
+    """
+    start_date = datetime.date(2022, 1, 1)
+    dates = [start_date + datetime.timedelta(weeks=i) for i in range(num_weeks)]
+
+    rng = np.random.default_rng(seed=42)
+    rainfall = 50 + 30 * np.sin(np.linspace(0, 3 * np.pi, num_weeks)) + rng.normal(0, 5, size=num_weeks)
+    temperature = 25 + 5 * np.sin(np.linspace(0, 2 * np.pi, num_weeks) + np.pi/3) + rng.normal(0, 1, size=num_weeks)
+    soil_moisture = 40 + 10 * np.cos(np.linspace(0, 2 * np.pi, num_weeks) + np.pi/6) + rng.normal(0, 3, size=num_weeks)
+
+    # A rough formula for "drought_index"
+    base_drought = 2.5 - 0.02*rainfall - 0.03*soil_moisture + 0.01*temperature
+    drought_index = base_drought + rng.normal(0, 0.5, size=num_weeks)
+    drought_index = np.clip(drought_index, 0, 5)
+
+    df = pd.DataFrame({
+        "date": dates,
+        "rainfall": rainfall,
+        "temperature": temperature,
+        "soil_moisture": soil_moisture,
+        "drought_index": drought_index
+    })
+    return df
+
+# ------------------------------------------
+# 2. Data Cleaning & Feature Engineering
+# ------------------------------------------
+
+def clean_and_prepare_data(df):
+    """
+    1. Clip negative rainfall to zero.
+    2. Fill missing columns with mean if found.
+    3. Sort by date.
+    4. Return cleaned DataFrame.
+    """
+    df["rainfall"] = df["rainfall"].clip(lower=0)
+    for col in ["rainfall", "temperature", "soil_moisture", "drought_index"]:
+        if df[col].isna().sum() > 0:
+            df[col].fillna(df[col].mean(), inplace=True)
+    df.sort_values("date", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+def create_time_series_windows(df, input_cols, target_col, window_size=4, forecast_horizon=4):
+    """
+    Convert the DataFrame into a supervised learning format for LSTM:
+      - window_size of past steps
+      - forecast_horizon steps ahead for the target
+    Returns:
+      X (num_samples, window_size, num_features)
+      y (num_samples,)
+    """
+    data = df[input_cols + [target_col]].values
+    X_list, y_list = [], []
+    num_points = len(data)
+
+    for i in range(num_points - window_size - forecast_horizon):
+        X_window = data[i : i + window_size, :-1]  # everything except last col => input features
+        y_target = data[i + window_size + forecast_horizon - 1, -1]  # last col => target
+        X_list.append(X_window)
+        y_list.append(y_target)
+
+    return np.array(X_list), np.array(y_list)
+
+# ------------------------------------------
+# 3. Build & Train LSTM Model
+# ------------------------------------------
+
+def build_lstm_model(input_shape):
+    """
+    Construct a simple Keras LSTM architecture:
+     - LSTM(64) with dropout
+     - Dense(32) + ReLU
+     - Dense(1) linear for a single regression output
+    """
+    model = Sequential()
+    model.add(LSTM(64, input_shape=input_shape, return_sequences=False))
+    model.add(Dropout(0.2))
+    model.add(Dense(32, activation='relu'))
+    model.add(Dense(1, activation='linear'))
+    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+    return model
+
+# ------------------------------------------
+# 4. Evaluation & Visualization
+# ------------------------------------------
+
+def plot_predictions(actual, predicted, title="Drought Index Forecast"):
+    """
+    Quick helper to visualize actual vs. predicted results
+    """
+    plt.figure(figsize=(10, 5))
+    plt.plot(actual, label="Actual", marker='o')
+    plt.plot(predicted, label="Predicted", marker='x')
+    plt.title(title)
+    plt.xlabel("Sample Index")
+    plt.ylabel("Drought Index")
+    plt.legend()
+    plt.show()
+
+# ------------------------------------------
+# 5. Model Deployment (Flask)
+# ------------------------------------------
+
+app = Flask(__name__)
+global_model = None
+global_scaler_means = None
+global_scaler_stds = None
+
+@app.route("/predict", methods=["POST"])
+def predict_drought():
+    """
+    Example Flask endpoint for real-time inference:
+    Expects JSON:
+      {
+        "rainfall": 50.0,
+        "temperature": 28.0,
+        "soil_moisture": 40.0
+      }
+    Returns a float "predicted_drought_index"
+    """
+    if global_model is None:
+        return jsonify({"error": "Model not loaded"}), 500
+
+    data = request.json
+    inp = np.array([
+        data["rainfall"],
+        data["temperature"],
+        data["soil_moisture"]
+    ]).reshape(1, 1, -1)
+
+    # Scale inputs
+    inp_scaled = (inp - global_scaler_means) / global_scaler_stds
+    pred = global_model.predict(inp_scaled)
+    pred_value = float(pred.flatten()[0])
+
+    # Clip 0 to 5
+    pred_value = max(0, min(pred_value, 5))
+    return jsonify({"predicted_drought_index": pred_value})
+
+# ------------------------------------------
+# Main Script
+# ------------------------------------------
+
+if __name__ == "__main__":
+    # 1) Data Generation
+    df = create_synthetic_drought_data(num_weeks=220)
+
+    # 2) Cleaning & Prep
+    df_clean = clean_and_prepare_data(df)
+
+    # Define input/target columns
+    input_cols = ["rainfall", "temperature", "soil_moisture"]
+    target_col = "drought_index"
+
+    # Simple standardization
+    feats = df_clean[input_cols].values
+    means = feats.mean(axis=0)
+    stds = feats.std(axis=0)
+    df_clean[input_cols] = (df_clean[input_cols] - means) / stds
+
+    # 3) Create LSTM windows
+    X, y = create_time_series_windows(df_clean, input_cols, target_col,
+                                      window_size=4, forecast_horizon=4)
+    print(f"Data shape after windowing: X={X.shape}, y={y.shape}")
+
+    # 4) Train-Test split
+    split_idx = int(0.8 * len(X))
+    X_train, y_train = X[:split_idx], y[:split_idx]
+    X_test, y_test = X[split_idx:], y[split_idx:]
+    print(f"Train shape: {X_train.shape}, {y_train.shape}")
+    print(f"Test shape:  {X_test.shape}, {y_test.shape}")
+
+    # Build model
+    model = build_lstm_model(input_shape=(X_train.shape[1], X_train.shape[2]))
+    model.summary()
+
+    # Checkpoints
+    checkpoint_path = "drought_lstm_best_model.h5"
+    early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+    model_ckpt = ModelCheckpoint(filepath=checkpoint_path, monitor='val_loss', save_best_only=True)
+
+    # Train
+    history = model.fit(X_train, y_train,
+                        validation_split=0.2,
+                        epochs=50,
+                        batch_size=8,
+                        callbacks=[early_stop, model_ckpt],
+                        verbose=1)
+
+    # Load best weights
+    model.load_weights(checkpoint_path)
+
+    # Evaluate
+    test_loss, test_mae = model.evaluate(X_test, y_test, verbose=0)
+    print(f"\nTest MSE: {test_loss:.4f}, Test MAE: {test_mae:.4f}")
+
+    # Predict and visualize
+    y_pred_test = model.predict(X_test).flatten()
+    y_pred_test = np.clip(y_pred_test, 0, 5)
+    plot_predictions(y_test, y_pred_test, "Drought Index Forecast (Test)")
+
+    # 5) Save (Keras format)
+    model.save("drought_lstm_full_model.keras")
+    print("Model saved in .keras format: 'drought_lstm_full_model.keras'")
+
+    # 6) Export as SavedModel using Keras 3's recommended approach:
+    #    Use `model.export()` for a TF SavedModel
+    try:
+        model.export("my_saved_model_tf")  # Creates TF SavedModel folder
+        print("Exported model to TF SavedModel in 'my_saved_model_tf/'")
+    except Exception as e:
+        print("Could not export as TF SavedModel:", e)
+        print("Continuing with .keras file only.")
+
+    # Attach model & scalers to Flask
+    global_model = model
+    global_scaler_means = means.reshape(1, 1, -1)
+    global_scaler_stds = stds.reshape(1, 1, -1)
+
+    # For local testing:
+    # app.run(debug=True, port=5000)
+
+    print("\nDone. Training complete and model ready for inference.")

@@ -1,0 +1,240 @@
+"""
+flood_risk_tensorflow.py
+
+End-to-end TensorFlow script (no Keras high-level API), specifically for DRR (Flood Risk):
+1) Synthetic Data Creation (flood risk classification).
+2) tf.data Pipeline.
+3) Custom Neural Network with tf.Module & Variables.
+4) Manual Training Loop with GradientTape.
+5) Model Saving & Loading (tf.saved_model) in a fully trackable manner.
+"""
+
+import numpy as np
+import tensorflow as tf
+
+# ------------------------------------------
+# 1. Generate Synthetic Data
+# ------------------------------------------
+
+def generate_flood_data(num_samples=2000):
+    """
+    Create synthetic features that might affect flood risk:
+      - rainfall (mm)
+      - soil_moisture (%)
+      - river_level (m)
+      - temperature (°C)
+      - region_elevation (m)
+    We'll produce a binary label: flood_occurred (0 or 1).
+    """
+
+    np.random.seed(42)
+    # 5 feature columns
+    rainfall = np.random.uniform(0, 300, size=num_samples)
+    soil_moisture = np.random.uniform(0, 100, size=num_samples)
+    river_level = np.random.uniform(0, 10, size=num_samples)
+    temperature = np.random.uniform(15, 35, size=num_samples)
+    region_elevation = np.random.uniform(0, 500, size=num_samples)
+
+    features = np.stack(
+        [rainfall, soil_moisture, river_level, temperature, region_elevation],
+        axis=1
+    )
+
+    # Synthetic flood_score
+    flood_score = (
+        0.03 * rainfall
+        + 0.02 * soil_moisture
+        + 0.5 * river_level
+        - 0.005 * region_elevation
+    )
+    noise = np.random.normal(0, 1, num_samples)
+    combined = flood_score + noise
+
+    threshold = 6.0
+    labels = (combined > threshold).astype(np.int32)
+
+    return features, labels
+
+# ------------------------------------------
+# 2. Create tf.data Pipeline
+# ------------------------------------------
+
+def make_dataset(features, labels, batch_size=32, shuffle=True):
+    ds = tf.data.Dataset.from_tensor_slices((features, labels))
+    if shuffle:
+        ds = ds.shuffle(buffer_size=len(features))
+    ds = ds.batch(batch_size)
+    return ds
+
+# ------------------------------------------
+# 3. Build a TF Module (Raw NN)
+# ------------------------------------------
+
+class FloodRiskModel(tf.Module):
+    """
+    A raw multi-layer perceptron for binary classification,
+    trackable by TensorFlow's SavedModel because we inherit from tf.Module
+    and store variables as attributes.
+    """
+
+    def __init__(self, input_dim=5, hidden_dim1=16, hidden_dim2=8, name=None):
+        super().__init__(name=name)
+        
+        # Use tf.random.normal, ensure dtype float32
+        w_init1 = tf.random.normal([input_dim, hidden_dim1], stddev=0.1, dtype=tf.float32)
+        b_init1 = tf.zeros([hidden_dim1], dtype=tf.float32)
+
+        w_init2 = tf.random.normal([hidden_dim1, hidden_dim2], stddev=0.1, dtype=tf.float32)
+        b_init2 = tf.zeros([hidden_dim2], dtype=tf.float32)
+
+        w_out = tf.random.normal([hidden_dim2, 1], stddev=0.1, dtype=tf.float32)
+        b_out = tf.zeros([1], dtype=tf.float32)
+
+        # Declare them as tracked tf.Variables
+        self.W1 = tf.Variable(w_init1, name="W1")
+        self.b1 = tf.Variable(b_init1, name="b1")
+
+        self.W2 = tf.Variable(w_init2, name="W2")
+        self.b2 = tf.Variable(b_init2, name="b2")
+
+        self.Wout = tf.Variable(w_out, name="Wout")
+        self.bout = tf.Variable(b_out, name="bout")
+
+    def forward(self, x):
+        """
+        Forward pass for raw NN: x shape (batch_size, input_dim)
+        Returns shape (batch_size, 1) (the logits).
+        """
+        x = tf.cast(x, tf.float32)  # ensure float32
+        h1 = tf.nn.relu(tf.matmul(x, self.W1) + self.b1)
+        h2 = tf.nn.relu(tf.matmul(h1, self.W2) + self.b2)
+        logits = tf.matmul(h2, self.Wout) + self.bout
+        return logits
+
+    @tf.function(input_signature=[tf.TensorSpec([None, None], dtype=tf.float32)])
+    def predict_logits(self, x):
+        """
+        SavedModel signature for returning raw logits.
+        """
+        return self.forward(x)
+
+    @tf.function(input_signature=[tf.TensorSpec([None, None], dtype=tf.float32)])
+    def predict_prob(self, x):
+        """
+        SavedModel signature for returning probability (sigmoid).
+        """
+        logits = self.forward(x)
+        return tf.sigmoid(logits)
+
+    @property
+    def trainable_variables(self):
+        """
+        Return list of trainable variables for optimizer.
+        (Alternatively, we could rely on self.variables, 
+         but let's be explicit.)
+        """
+        return [self.W1, self.b1, self.W2, self.b2, self.Wout, self.bout]
+
+# ------------------------------------------
+# 4. Training & Evaluation Loop
+# ------------------------------------------
+
+def train_step(model, x_batch, y_batch, optimizer):
+    x_batch = tf.cast(x_batch, tf.float32)
+    y_batch = tf.cast(y_batch, tf.float32)
+
+    with tf.GradientTape() as tape:
+        logits = model.forward(x_batch)
+        loss = tf.nn.sigmoid_cross_entropy_with_logits(
+            labels=tf.squeeze(y_batch), logits=tf.squeeze(logits)
+        )
+        loss = tf.reduce_mean(loss)
+
+    grads = tape.gradient(loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+    return loss
+
+def compute_accuracy(model, dataset):
+    correct = 0
+    total = 0
+    for x_batch, y_batch in dataset:
+        logits = model.forward(x_batch)
+        probs = tf.sigmoid(logits)
+        preds = tf.cast(probs > 0.5, tf.int32)
+        
+        # y_batch shape might be (batch_size,) => reshape if needed
+        y_batch = tf.cast(tf.reshape(y_batch, [-1, 1]), tf.int32)
+        eq = tf.cast(preds == y_batch, tf.int32)
+        correct += int(tf.reduce_sum(eq))
+        total += x_batch.shape[0]
+    return correct / total
+
+# ------------------------------------------
+# Main Script
+# ------------------------------------------
+
+if __name__ == "__main__":
+    # Hyperparams
+    BATCH_SIZE = 32
+    EPOCHS = 5
+    LR = 1e-3
+
+    # 1) Generate Synthetic Data
+    features, labels = generate_flood_data(num_samples=2000)
+    # Convert to float32
+    features = features.astype(np.float32)
+
+    # 2) Train-Test Split
+    split_idx = int(0.8 * len(features))
+    train_features, test_features = features[:split_idx], features[split_idx:]
+    train_labels, test_labels = labels[:split_idx], labels[split_idx:]
+
+    # 3) Create tf.data Datasets
+    train_ds = make_dataset(train_features, train_labels, BATCH_SIZE, shuffle=True)
+    test_ds = make_dataset(test_features, test_labels, BATCH_SIZE, shuffle=False)
+
+    # 4) Build Model
+    input_dim = train_features.shape[1]  # 5
+    model = FloodRiskModel(input_dim=input_dim, hidden_dim1=32, hidden_dim2=16)
+
+    # 5) Training Loop
+    optimizer = tf.keras.optimizers.Adam(learning_rate=LR)
+
+    for epoch in range(EPOCHS):
+        epoch_loss = 0.0
+        steps = 0
+        for x_batch, y_batch in train_ds:
+            loss_val = train_step(model, x_batch, y_batch, optimizer)
+            epoch_loss += float(loss_val)
+            steps += 1
+
+        # Evaluate
+        train_acc = compute_accuracy(model, make_dataset(train_features, train_labels, BATCH_SIZE, shuffle=False))
+        test_acc = compute_accuracy(model, test_ds)
+
+        print(f"Epoch {epoch+1}/{EPOCHS}, Loss={epoch_loss/steps:.4f}, "
+              f"Train Acc={train_acc:.4f}, Test Acc={test_acc:.4f}")
+
+    # Final Test Accuracy
+    final_acc = compute_accuracy(model, test_ds)
+    print(f"\nFinal Test Accuracy = {final_acc:.4f}\n")
+
+    # 6) Save as TF SavedModel
+    save_dir = "flood_risk_savedmodel"
+    tf.saved_model.save(model, save_dir)
+    print(f"Saved model to: {save_dir}")
+
+    # 7) Demonstrate reloading & inference
+    print("\nReloading model for test inference:")
+    loaded_model = tf.saved_model.load(save_dir)
+
+    # The loaded model has 'predict_prob' and 'predict_logits'
+    # defined by the @tf.function decorators with signatures
+    sample_input = test_features[:5]  # shape (5, 5)
+    sample_probs = loaded_model.predict_prob(sample_input)
+    preds = tf.cast(sample_probs > 0.5, tf.int32).numpy().flatten()
+
+    print("Sample input:\n", sample_input)
+    print("Probabilities:\n", sample_probs.numpy().flatten())
+    print("Predicted classes:\n", preds)
+    print("Ground truth:\n", test_labels[:5])

@@ -1,4 +1,4 @@
-# Disaster-Risk-Reduction-Projects (UNDRR) - by BEKAS Ioannis
+# Disaster-Risk-Reduction-Projects - by BEKAS Ioannis
 
 
 This repository contains a collection of AI-driven projects designed to support disaster risk reduction (DRR) efforts. These projects leverage machine learning and deep learning to predict and mitigate the impact of extreme weather events such as tropical storms, droughts, and floods. By utilizing data-driven approaches, these models provide early warning systems (EWS) to aid decision-makers in disaster preparedness, mitigation, and response. Each project focuses on a specific disaster scenario, incorporating predictive modeling, feature engineering, and real-world deployment strategies.
